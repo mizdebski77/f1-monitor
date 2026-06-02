@@ -12,6 +12,9 @@ from typing import List, Dict
 import schedule
 from loguru import logger
 
+HEARTBEAT_INTERVAL_MINUTES = 15  # co ile minut wysyłać heartbeat gdy brak newsów
+_HEARTBEAT_FILE = "data/last_heartbeat.txt"
+
 import config
 import database
 import monitor
@@ -55,6 +58,57 @@ def setup_logging():
     )
 
     logger.info("System logowania zainicjalizowany")
+
+
+# ============================================================
+# HEARTBEAT - wysyła ping gdy brak newsów
+# ============================================================
+def _maybe_send_heartbeat():
+    """
+    Wysyła heartbeat co HEARTBEAT_INTERVAL_MINUTES minut.
+    Działa zarówno lokalnie (plik) jak i na GitHub Actions (minuta cyklu).
+    """
+    import os
+    os.makedirs("data", exist_ok=True)
+
+    now = datetime.utcnow()
+
+    # GitHub Actions: sprawdź minutę bieżącego czasu
+    # Heartbeat wysyłamy gdy minuta % HEARTBEAT_INTERVAL_MINUTES == 0
+    # (np. 00, 15, 30, 45 = co 15 minut)
+    current_minute = now.hour * 60 + now.minute
+    is_heartbeat_minute = (current_minute % HEARTBEAT_INTERVAL_MINUTES) < config.CHECK_INTERVAL_MINUTES
+
+    # Lokalnie: użyj pliku żeby nie wysyłać dwa razy w tej samej chwili
+    last_hb = None
+    if os.path.exists(_HEARTBEAT_FILE):
+        try:
+            with open(_HEARTBEAT_FILE, "r") as f:
+                last_hb = datetime.fromisoformat(f.read().strip())
+        except Exception:
+            pass
+
+    minutes_since = (now - last_hb).total_seconds() / 60 if last_hb else 999
+    already_sent_recently = minutes_since < HEARTBEAT_INTERVAL_MINUTES - 2
+
+    if is_heartbeat_minute and not already_sent_recently:
+        now_str = now.strftime("%d.%m.%Y %H:%M UTC")
+        sources = len([s for s in config.RSS_SOURCES if s.get("enabled", True)])
+        msg = (
+            f"💚 F1 Monitor działa poprawnie\n"
+            f"⏰ {now_str}\n"
+            f"📭 Brak nowych newsów F1\n"
+            f"🔄 Monitoruję {sources} źródeł co {config.CHECK_INTERVAL_MINUTES} min\n"
+            f"🏎️ F1 Monitor Bot"
+        )
+        notifier.send_message(msg)
+        logger.info("Wysłano heartbeat")
+
+        with open(_HEARTBEAT_FILE, "w") as f:
+            f.write(now.isoformat())
+    else:
+        next_hb = HEARTBEAT_INTERVAL_MINUTES - (current_minute % HEARTBEAT_INTERVAL_MINUTES)
+        logger.debug(f"Heartbeat za ~{next_hb} min")
 
 
 # ============================================================
@@ -129,7 +183,8 @@ def run_monitor_cycle():
     )
 
     if new_unique_count == 0:
-        logger.info("Brak nowych unikalnych newsów - cykl zakończony")
+        logger.info("Brak nowych unikalnych newsów")
+        _maybe_send_heartbeat()
         return
 
     # ── Krok 5: Powiadomienia Telegram ───────────────────
@@ -148,61 +203,35 @@ def run_monitor_cycle():
             if article.get("is_duplicate"):
                 continue
 
-            # Limit powiadomień
-            if notification_count >= 5:  # max 5 na raz
+            # Limit powiadomień na cykl
+            if notification_count >= 5:
                 logger.debug("Limit 5 powiadomień na cykl - pomijam resztę")
                 break
 
             try:
-                success = notifier.send_news_notification(article)
+                # Generuj treści i wyślij JEDNĄ połączoną wiadomość
+                content = content_generator.generate_content(article)
+                if content:
+                    database.save_generated_content(
+                        news_id, content, model=config.HF_MODEL
+                    )
+                    database.mark_content_generated(news_id)
+                    success = notifier.send_content_notification(article, content)
+                else:
+                    # Fallback: wyślij sam news bez treści
+                    success = notifier.send_news_notification(article)
+
                 if success:
                     database.mark_as_notified(news_id)
                     notification_count += 1
-                    # Opóźnienie między powiadomieniami (anti-spam)
                     time.sleep(1)
                 else:
                     logger.warning(f"Nie wysłano powiadomienia dla ID={news_id}")
+
             except Exception as e:
                 logger.error(f"Błąd powiadomienia dla ID={news_id}: {e}")
 
         logger.info(f"   Wysłano {notification_count} powiadomień")
-
-    # ── Krok 6: Generowanie treści social media ───────────
-    logger.info("🤖 Krok 6: Generowanie treści social media...")
-
-    # Sprawdź limit generowań
-    recent_generations = database.count_recent_generations(hours=1)
-    if recent_generations >= config.MAX_CONTENT_GENERATIONS_PER_HOUR:
-        logger.warning(
-            f"Limit generowań ({config.MAX_CONTENT_GENERATIONS_PER_HOUR}/h) wyczerpany - pomijam"
-        )
-    else:
-        to_generate = database.get_news_without_content()
-        gen_count = 0
-
-        for news_article in to_generate:
-            if gen_count >= 3:  # max 3 generowania na cykl
-                break
-
-            try:
-                content = content_generator.generate_content(news_article)
-                if content:
-                    database.save_generated_content(
-                        news_article["id"],
-                        content,
-                        model=config.HF_MODEL,
-                    )
-                    database.mark_content_generated(news_article["id"])
-
-                    # Wyślij treści do Telegram
-                    notifier.send_content_notification(news_article, content)
-                    gen_count += 1
-                    time.sleep(2)  # opóźnienie między generowaniami
-
-            except Exception as e:
-                logger.error(f"Błąd generowania treści dla ID={news_article['id']}: {e}")
-
-        logger.info(f"   Wygenerowano treści dla {gen_count} newsów")
 
     # ── Podsumowanie cyklu ────────────────────────────────
     duration = (datetime.utcnow() - cycle_start).total_seconds()
