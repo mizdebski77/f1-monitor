@@ -84,7 +84,7 @@ def _normalize_rss_entry(entry: Any, source: Dict) -> Optional[Dict[str, Any]]:
             or getattr(entry, "description", "")
             or ""
         )
-        description = _clean_html(raw_description)[:500]  # max 500 znaków
+        description = _clean_html(raw_description)
 
         # Data publikacji
         published_at = _parse_date(entry)
@@ -133,6 +133,67 @@ def _parse_date(entry: Any) -> str:
 
     # Jeśli nic nie zadziała - obecny czas
     return datetime.utcnow().isoformat()
+
+
+def fetch_full_article_text(url: str) -> str:
+    """
+    Pobiera pełny tekst artykułu ze strony.
+    Wyciąga samo 'mięso' — paragrafy z treścią, bez reklam i nawigacji.
+    Zwraca pusty string jeśli nie uda się pobrać.
+    """
+    try:
+        response = requests.get(
+            url,
+            headers=config.HTTP_HEADERS,
+            timeout=config.REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Usuń śmieci: nawigacja, reklamy, stopki, skrypty
+        for tag in soup(["script", "style", "nav", "header", "footer",
+                         "aside", "form", "iframe", "ads", "advertisement"]):
+            tag.decompose()
+        for tag in soup.find_all(class_=lambda c: c and any(
+            x in str(c).lower() for x in
+            ["ad", "promo", "banner", "sidebar", "related", "comment",
+             "social", "share", "newsletter", "cookie", "popup"]
+        )):
+            tag.decompose()
+
+        # Szukaj głównej treści artykułu
+        article_text = ""
+
+        # Próba 1: tagi semantyczne
+        for selector in ["article", "main", "[class*='article-body']",
+                         "[class*='article__body']", "[class*='post-content']",
+                         "[class*='entry-content']", "[class*='story-body']",
+                         "[class*='article-content']", "[class*='content-body']"]:
+            container = soup.select_one(selector)
+            if container:
+                paragraphs = container.find_all("p")
+                text = " ".join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 40)
+                if len(text) > 200:
+                    article_text = text
+                    break
+
+        # Próba 2: wszystkie paragrafy jeśli nie znaleziono kontenera
+        if not article_text:
+            paragraphs = soup.find_all("p")
+            text = " ".join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 40)
+            if len(text) > 200:
+                article_text = text
+
+        # Wyczyść tekst
+        import re
+        article_text = re.sub(r"\s+", " ", article_text).strip()
+
+        logger.debug(f"Pobrano pełny tekst ({len(article_text)} znaków): {url[:60]}")
+        return article_text
+
+    except Exception as e:
+        logger.debug(f"Nie udało się pobrać pełnego tekstu: {e}")
+        return ""
 
 
 def _clean_html(html_text: str) -> str:
@@ -328,6 +389,19 @@ def fetch_all_news() -> List[Dict[str, Any]]:
         f"Łącznie pobrano: {len(valid_articles)} artykułów "
         f"({len(all_articles) - len(valid_articles)} odrzuconych)"
     )
+
+    # Pobierz pełny tekst dla artykułów z krótkim opisem
+    logger.info("Pobieranie pełnych tekstów artykułów...")
+    enriched = 0
+    for article in valid_articles:
+        if len(article.get("description", "")) < 300:
+            full_text = fetch_full_article_text(article["url"])
+            if full_text:
+                article["description"] = full_text
+                enriched += 1
+        time.sleep(0.5)
+
+    logger.info(f"Wzbogacono {enriched} artykułów o pełny tekst")
 
     return valid_articles
 
