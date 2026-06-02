@@ -315,8 +315,8 @@ def _generate_template_content(article: Dict) -> Dict[str, str]:
     }
     emoji = emoji_map.get(priority, "🏎️")
 
-    # Opis do użycia w postach
-    desc = description[:200] if description else ""
+    # Opis do użycia w postach - pełny tekst bez limitu
+    desc = description if description else ""
 
     # Hashtagi
     hashtags = _generate_hashtags(title, priority)
@@ -538,65 +538,63 @@ def generate_content(article: Dict) -> Dict[str, str]:
 def format_content_for_telegram(article: Dict, content: Dict[str, str]) -> str:
     """
     Formatuje wygenerowane treści do wysłania przez Telegram.
-    Zwraca gotowy tekst wiadomości.
+    Jeden zwarty post: emoji + priorytet + tytuł + opis + źródło + hashtagi + link.
     """
     title = article.get("title", "")
     priority = article.get("priority", "LOW")
+    source = article.get("source_name", "")
+    url = article.get("url", "")
     emoji = config.PRIORITY_EMOJI.get(priority, "📰")
+    sep = "─" * 35
+
+    priority_pl = {
+        "BREAKING": "🔴 PILNE",
+        "HIGH": "🟠 WAŻNE",
+        "MEDIUM": "🟡 NOWOŚĆ",
+        "LOW": "🟢 F1 INFO",
+    }.get(priority, "F1 INFO")
+
+    # Użyj opisu bezpośrednio z artykułu
+    description = article.get("description", "")
+
+    hashtags = content.get("hashtags", "")
+    graphic = content.get("graphic_idea", "")
 
     parts = [
-        f"🎨 *WYGENEROWANE TREŚCI SOCIAL MEDIA*",
+        f"{emoji} {priority_pl}",
         f"",
-        f"📰 News: _{title[:80]}_",
+        f"📌 {title}",
+        f"",
+        f"{sep}",
+        f"",
+        f"{description}",
+        f"",
+        f"{sep}",
         f"",
     ]
 
-    if content.get("tiktok_script"):
+    if source:
+        parts.append(f"📡 Źródło: {source}")
+    if url:
+        parts.append(f"🔗 {url}")
+
+    parts.append("")
+
+    if hashtags:
+        parts.append(hashtags)
+
+    if graphic:
         parts.extend([
-            f"🎵 *TikTok Script:*",
-            f"```",
-            f"{content['tiktok_script'][:400]}",
-            f"```",
             f"",
+            f"{sep}",
+            f"🖼️ Pomysł na grafikę: {graphic}",
         ])
 
-    if content.get("twitter_post"):
-        tw = content["twitter_post"][:280]
-        parts.extend([
-            f"🐦 *X/Twitter ({len(tw)} znaków):*",
-            f"```",
-            f"{tw}",
-            f"```",
-            f"",
-        ])
-
-    if content.get("instagram_post"):
-        parts.extend([
-            f"📸 *Instagram:*",
-            f"```",
-            f"{content['instagram_post'][:300]}",
-            f"```",
-            f"",
-        ])
-
-    if content.get("seo_title"):
-        parts.extend([
-            f"🔍 *SEO Tytuł:* `{content['seo_title'][:60]}`",
-            f"",
-        ])
-
-    if content.get("hashtags"):
-        parts.extend([
-            f"#️⃣ *Hashtagi:*",
-            f"`{content['hashtags'][:200]}`",
-            f"",
-        ])
-
-    if content.get("graphic_idea"):
-        parts.extend([
-            f"🖼️ *Pomysł na grafikę:*",
-            f"_{content['graphic_idea'][:200]}_",
-        ])
+    parts.extend([
+        f"",
+        f"{sep}",
+        f"🏎️ F1 Monitor Bot",
+    ])
 
     return "\n".join(parts)
 
