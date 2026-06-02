@@ -22,11 +22,11 @@ TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 # HUGGINGFACE
 # ============================================================
 HUGGINGFACE_API_TOKEN: str = os.getenv("HUGGINGFACE_API_TOKEN", "")
-HF_MODEL: str = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
+HF_MODEL: str = os.getenv("HF_MODEL", "HuggingFaceH4/zephyr-7b-beta")
 HF_API_URL: str = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
-HF_MAX_TOKENS: int = 1200
+HF_MAX_TOKENS: int = 800
 HF_TEMPERATURE: float = 0.7
-HF_TIMEOUT: int = 60  # sekundy
+HF_TIMEOUT: int = 45  # sekundy
 
 
 # ============================================================

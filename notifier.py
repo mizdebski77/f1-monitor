@@ -116,7 +116,6 @@ def send_message(text: str, parse_mode: str = "Markdown") -> bool:
         payload = {
             "chat_id": config.TELEGRAM_CHAT_ID,
             "text": chunk,
-            "parse_mode": parse_mode,
             "disable_web_page_preview": True,
         }
 
@@ -124,19 +123,8 @@ def send_message(text: str, parse_mode: str = "Markdown") -> bool:
         if result:
             logger.debug(f"Telegram: wiadomość wysłana (część {i+1}/{len(chunks)})")
         else:
-            # Spróbuj bez formatowania Markdown (może zawierać błędne znaki)
-            if parse_mode != "HTML":
-                logger.warning("Retry bez Markdown...")
-                payload["parse_mode"] = None
-                # Wyczyść znaki specjalne Markdown
-                clean_text = chunk.replace("*", "").replace("_", "").replace("`", "")
-                payload["text"] = clean_text
-                result = _telegram_request("sendMessage", payload)
-                if not result:
-                    logger.error(f"Telegram: nie udało się wysłać części {i+1}")
-                    success = False
-            else:
-                success = False
+            logger.error(f"Telegram: nie udało się wysłać części {i+1}")
+            success = False
 
         # Małe opóźnienie między częściami
         if i < len(chunks) - 1:
@@ -188,25 +176,25 @@ def format_news_notification(article: Dict) -> str:
         "LOW": "🟢 LOW - Ciekawostka",
     }.get(priority, priority)
 
-    message = f"""{emoji} *NOWY NEWS F1* {emoji}
+    message = f"""{emoji} NOWY NEWS F1 {emoji}
 
-📌 *Tytuł:* {_escape_markdown(title)}
+📌 Tytuł: {title}
 
-📡 *Źródło:* {_escape_markdown(source)}
+📡 Źródło: {source}
 
-🏷️ *Priorytet:* {priority_pl}
+🏷️ Priorytet: {priority_pl}
 
-📝 *Krótki opis:*
-_{_escape_markdown(short_desc)}_"""
+📝 Krótki opis:
+{short_desc}"""
 
     if date_str:
-        message += f"\n\n⏰ *Data:* {date_str}"
+        message += f"\n\n⏰ Data: {date_str}"
 
     if url:
-        message += f"\n\n🔗 *Link:* {url}"
+        message += f"\n\n🔗 Link: {url}"
 
     message += "\n\n─────────────────────"
-    message += "\n🏎️ _F1 Monitor Bot_"
+    message += "\n🏎️ F1 Monitor Bot"
 
     return message
 
