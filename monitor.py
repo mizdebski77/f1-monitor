@@ -346,6 +346,80 @@ def scrape_fia_news() -> List[Dict[str, Any]]:
 
 
 # ============================================================
+# FILTR F1
+# ============================================================
+# Słowa które MUSZĄ pojawić się w tytule lub URL żeby artykuł był uznany za F1
+F1_KEYWORDS = [
+    "formula 1", "formula1", "f1", "grand prix", "gp ",
+    "formel 1", "formule 1",
+    # Zespoły F1
+    "ferrari", "mercedes", "red bull", "mclaren", "alpine",
+    "aston martin", "williams", "haas", "sauber", "audi f1",
+    "kick sauber", "racing bulls", "visa cash app",
+    # Kierowcy F1
+    "hamilton", "verstappen", "leclerc", "norris", "sainz",
+    "alonso", "russell", "piastri", "perez", "stroll",
+    "albon", "hulkenberg", "gasly", "ocon", "bottas",
+    "zhou", "tsunoda", "lawson", "colapinto", "bearman",
+    "doohan", "hadjar", "antonelli",
+    # Terminy F1
+    "fia", "pit stop", "pitstop", "qualifying", "pole position",
+    "drs", "safety car", "virtual safety car", "fastest lap",
+    "constructors championship", "drivers championship",
+    "power unit", "parc ferme",
+]
+
+# Słowa które WYKLUCZAJĄ artykuł (inne serie motorsport)
+NON_F1_KEYWORDS = [
+    "motogp", "moto gp", "moto2", "moto3",
+    "isle of man tt", "isle of man", " tt ", "tt win", "tt race",
+    "superbike", "supersport race", "motorbike", "motorcycle",
+    "indycar", "nascar", "wrc", "rally", "dakar",
+    "dtm", "formula e", "fe ", "formula 2", "formula 3",
+    "f2 ", "f3 ", " f2", " f3",
+    "motogp race", "supercross", "endurance",
+]
+
+
+def _is_f1_related(article: Dict) -> bool:
+    """
+    Sprawdza czy artykuł jest związany z Formułą 1.
+    Zwraca True tylko dla newsów o F1.
+    """
+    title = article.get("title", "").lower()
+    url = article.get("url", "").lower()
+    description = article.get("description", "").lower()[:300]
+    source_category = article.get("source_category", "")
+
+    # Oficjalne źródła F1 i FIA - zawsze przepuszczamy
+    if source_category == "official":
+        return True
+
+    # Sprawdź czy URL wskazuje na inną serię
+    url_non_f1 = ["/tt/", "/motogp/", "/moto2/", "/moto3/", "/indycar/",
+                  "/nascar/", "/rally/", "/wrc/", "/formula-e/", "/f2/", "/f3/"]
+    for pattern in url_non_f1:
+        if pattern in url:
+            logger.debug(f"Odfiltrowano (URL nie-F1 '{pattern}'): {article['title'][:60]}")
+            return False
+
+    # Sprawdź słowa wykluczające w tytule
+    for kw in NON_F1_KEYWORDS:
+        if kw in title:
+            logger.debug(f"Odfiltrowano ('{kw}' w tytule): {article['title'][:60]}")
+            return False
+
+    # Sprawdź czy zawiera słowa kluczowe F1
+    combined = title + " " + url + " " + description
+    for kw in F1_KEYWORDS:
+        if kw in combined:
+            return True
+
+    logger.debug(f"Odfiltrowano (brak słów kluczowych F1): {article['title'][:60]}")
+    return False
+
+
+# ============================================================
 # GŁÓWNA FUNKCJA POBIERANIA
 # ============================================================
 def fetch_all_news() -> List[Dict[str, Any]]:
@@ -385,9 +459,14 @@ def fetch_all_news() -> List[Dict[str, Any]]:
         if a.get("url") and a.get("title") and len(a["title"]) > 5
     ]
 
+    # Filtruj tylko artykuły związane z F1
+    f1_articles = [a for a in valid_articles if _is_f1_related(a)]
+    filtered_out = len(valid_articles) - len(f1_articles)
+    valid_articles = f1_articles
+
     logger.info(
-        f"Łącznie pobrano: {len(valid_articles)} artykułów "
-        f"({len(all_articles) - len(valid_articles)} odrzuconych)"
+        f"Łącznie pobrano: {len(valid_articles)} artykułów F1 "
+        f"({filtered_out} odfiltrowanych jako nie-F1)"
     )
 
     # Pobierz pełny tekst dla artykułów z krótkim opisem
