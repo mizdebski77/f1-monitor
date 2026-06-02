@@ -75,7 +75,7 @@ def _telegram_request(method: str, payload: Dict, retries: int = 3) -> Optional[
     return None
 
 
-def send_message(text: str, parse_mode: str = "Markdown") -> bool:
+def send_message(text: str, parse_mode: str = None) -> bool:
     """
     Wysyła wiadomość tekstową na Telegram.
     Automatycznie dzieli długie wiadomości (limit 4096 znaków).
