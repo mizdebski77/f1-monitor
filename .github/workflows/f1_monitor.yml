@@ -20,6 +20,13 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Restore database cache
+        uses: actions/cache@v4
+        with:
+          path: data/f1_monitor.db
+          key: f1-database
+          restore-keys: f1-database
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -29,3 +36,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           HUGGINGFACE_API_TOKEN: ${{ secrets.HUGGINGFACE_API_TOKEN }}
         run: python main.py --mode once
+
+      - name: Save database cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data/f1_monitor.db
+          key: f1-database-${{ github.run_id }}

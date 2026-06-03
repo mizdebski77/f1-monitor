@@ -26,7 +26,7 @@ HF_MODEL: str = os.getenv("HF_MODEL", "HuggingFaceH4/zephyr-7b-beta")
 HF_API_URL: str = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
 HF_MAX_TOKENS: int = 800
 HF_TEMPERATURE: float = 0.7
-HF_TIMEOUT: int = 45  # sekundy
+HF_TIMEOUT: int = 10  # sekundy (krótszy timeout)
 
 
 # ============================================================
