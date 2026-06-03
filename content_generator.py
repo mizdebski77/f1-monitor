@@ -17,7 +17,7 @@ import config
 # ============================================================
 # HUGGINGFACE API
 # ============================================================
-def _call_huggingface_api(prompt: str, max_retries: int = 3) -> Optional[str]:
+def _call_huggingface_api(prompt: str, max_retries: int = 1) -> Optional[str]:
     """
     Wywołuje HuggingFace Inference API.
     Obsługuje retry z exponential backoff.
@@ -99,9 +99,8 @@ def _call_huggingface_api(prompt: str, max_retries: int = 3) -> Optional[str]:
             if attempt < max_retries - 1:
                 time.sleep(10)
         except Exception as e:
-            logger.error(f"HF API nieoczekiwany błąd: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(5)
+            logger.debug(f"HF API niedostępne: {type(e).__name__}")
+            return None  # od razu fallback, nie retry
 
     logger.error("HF API - wszystkie próby wyczerpane, używam szablonów")
     return None

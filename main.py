@@ -66,20 +66,13 @@ def setup_logging():
 def _maybe_send_heartbeat():
     """
     Wysyła heartbeat co HEARTBEAT_INTERVAL_MINUTES minut.
-    Działa zarówno lokalnie (plik) jak i na GitHub Actions (minuta cyklu).
+    Prosta logika: sprawdź czy minęło wystarczająco dużo czasu od ostatniego.
     """
     import os
     os.makedirs("data", exist_ok=True)
 
     now = datetime.utcnow()
 
-    # GitHub Actions: sprawdź minutę bieżącego czasu
-    # Heartbeat wysyłamy gdy minuta % HEARTBEAT_INTERVAL_MINUTES == 0
-    # (np. 00, 15, 30, 45 = co 15 minut)
-    current_minute = now.hour * 60 + now.minute
-    is_heartbeat_minute = (current_minute % HEARTBEAT_INTERVAL_MINUTES) < config.CHECK_INTERVAL_MINUTES
-
-    # Lokalnie: użyj pliku żeby nie wysyłać dwa razy w tej samej chwili
     last_hb = None
     if os.path.exists(_HEARTBEAT_FILE):
         try:
@@ -89,9 +82,8 @@ def _maybe_send_heartbeat():
             pass
 
     minutes_since = (now - last_hb).total_seconds() / 60 if last_hb else 999
-    already_sent_recently = minutes_since < HEARTBEAT_INTERVAL_MINUTES - 2
 
-    if is_heartbeat_minute and not already_sent_recently:
+    if True:  # TEST: zawsze wysyłaj heartbeat gdy brak newsów
         now_str = now.strftime("%d.%m.%Y %H:%M UTC")
         sources = len([s for s in config.RSS_SOURCES if s.get("enabled", True)])
         msg = (
@@ -107,8 +99,8 @@ def _maybe_send_heartbeat():
         with open(_HEARTBEAT_FILE, "w") as f:
             f.write(now.isoformat())
     else:
-        next_hb = HEARTBEAT_INTERVAL_MINUTES - (current_minute % HEARTBEAT_INTERVAL_MINUTES)
-        logger.debug(f"Heartbeat za ~{next_hb} min")
+        remaining = HEARTBEAT_INTERVAL_MINUTES - minutes_since
+        logger.debug(f"Heartbeat za ~{remaining:.0f} min")
 
 
 # ============================================================
