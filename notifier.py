@@ -96,6 +96,20 @@ def send_message(text: str, parse_mode: str = None) -> bool:
         current_len = 0
 
         for line in lines:
+            # Zabezpieczenie: jeśli SAMA linia jest dłuższa niż limit
+            # (np. nieprzycięty, zeskrapowany tekst artykułu bez podziałów),
+            # dzielimy ją na kawałki na siłę. Bez tego taka linia trafiała
+            # do własnego chunka, który i tak przekraczał limit, Telegram
+            # go odrzucał (błąd 400) i cała treść ginęła bez śladu.
+            if len(line) > MAX_MSG_LEN:
+                if current_chunk:
+                    chunks.append("\n".join(current_chunk))
+                    current_chunk = []
+                    current_len = 0
+                for i in range(0, len(line), MAX_MSG_LEN):
+                    chunks.append(line[i:i + MAX_MSG_LEN])
+                continue
+
             line_len = len(line) + 1
             if current_len + line_len > MAX_MSG_LEN:
                 if current_chunk:
@@ -305,10 +319,25 @@ def send_stats_notification(stats: Dict) -> bool:
     return send_message(msg)
 
 
-def send_content_notification(article: Dict, content: Dict[str, str]) -> bool:
-    """Wysyła wygenerowane treści social media do Telegrama."""
+def send_content_notification(
+    article: Dict,
+    content: Dict[str, str],
+    source_names: Optional[list] = None,
+    is_update: bool = False,
+) -> bool:
+    """
+    Wysyła wygenerowane treści social media do Telegrama.
+    Przekazuje dalej info o ewentualnym łączeniu źródeł, żeby wiadomość
+    pokazywała gotowe, opisane teksty (patrz content_generator). Tekst na
+    Twitter/X jest tylko do ręcznego wklejenia - system nie postuje
+    automatycznie.
+    """
     from content_generator import format_content_for_telegram
-    msg = format_content_for_telegram(article, content)
+    msg = format_content_for_telegram(
+        article, content,
+        source_names=source_names,
+        is_update=is_update,
+    )
     return send_message(msg)
 
 

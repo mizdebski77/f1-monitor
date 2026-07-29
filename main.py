@@ -104,6 +104,51 @@ def _maybe_send_heartbeat():
 
 
 # ============================================================
+# AKTUALIZACJE PO POŁĄCZENIU ŹRÓDEŁ (TEN SAM TEMAT)
+# ============================================================
+def _send_merge_updates(target_ids) -> None:
+    """
+    Dla newsów, które JUŻ zostały wcześniej wysłane na Telegram, a w tym cyklu
+    dostały nowe źródło potwierdzające ten sam temat - łączy opisy wszystkich
+    znanych źródeł, regeneruje treści social media i wysyła wiadomość-aktualizację
+    z odświeżonymi, gotowymi tekstami na Instagram/Twitter.
+
+    Newsy, które jeszcze nie zostały wysłane (np. dopiero w tym samym cyklu
+    wykryto kilka źródeł na raz) są pomijane tutaj - dostaną już połączoną
+    treść przy swoim pierwszym powiadomieniu (patrz run_monitor_cycle).
+    """
+    for news_id in target_ids:
+        try:
+            original = database.get_news_by_id(news_id)
+            if not original or not original.get("notified"):
+                continue
+
+            extra_sources = database.get_news_sources(news_id)
+            if not extra_sources:
+                continue
+
+            merged_desc = content_generator.build_merged_description(original, extra_sources)
+            merged_article = {**original, "description": merged_desc}
+
+            new_content = content_generator.generate_content(merged_article)
+            database.save_generated_content(news_id, new_content, model=config.HF_MODEL)
+
+            all_names = [original.get("source_name", "")] + [
+                s.get("source_name", "") for s in extra_sources
+            ]
+            all_names = [n for n in all_names if n]
+
+            notifier.send_content_notification(
+                merged_article, new_content,
+                source_names=all_names,
+                is_update=True,
+            )
+            logger.info(f"🔄 Wysłano aktualizację dla ID={news_id} ({len(all_names)} źródeł)")
+        except Exception as e:
+            logger.error(f"Błąd wysyłania aktualizacji dla ID={news_id}: {e}")
+
+
+# ============================================================
 # GŁÓWNA PĘTLA MONITOROWANIA
 # ============================================================
 def run_monitor_cycle():
@@ -154,25 +199,57 @@ def run_monitor_cycle():
         logger.error(f"Błąd deduplikacji: {e}")
         deduplicated = [{**a, "is_duplicate": False} for a in classified]
 
-    # ── Krok 4: Zapis do bazy ─────────────────────────────
+    # ── Krok 4: Zapis do bazy + łączenie źródeł ──────────
     logger.info("💾 Krok 4: Zapis do bazy danych...")
     saved_ids = []
     new_unique_count = 0
+    merge_targets = set()  # ID newsów, które w tym cyklu dostały nowe źródło
 
     for article in deduplicated:
         try:
-            news_id = database.insert_news(article)
-            if news_id:
-                saved_ids.append((news_id, article))
-                if not article.get("is_duplicate"):
+            if article.get("is_duplicate"):
+                # Spróbuj połączyć opis tego "duplikatu" z oryginałem
+                # (ten sam temat z innego źródła) zamiast po prostu go wyrzucać.
+                target_id = article.get("duplicate_of_id")
+                if not target_id:
+                    merge_ref = article.get("merge_into_article")
+                    if merge_ref:
+                        target_id = merge_ref.get("_db_id")
+
+                if target_id:
+                    try:
+                        database.add_news_source(
+                            target_id,
+                            article.get("source_name", ""),
+                            article.get("url", ""),
+                            article.get("description", ""),
+                        )
+                        merge_targets.add(target_id)
+                    except Exception as e:
+                        logger.error(f"Błąd łączenia źródła z ID={target_id}: {e}")
+
+                news_id = database.insert_news(article)
+                if news_id:
+                    saved_ids.append((news_id, article))
+            else:
+                news_id = database.insert_news(article)
+                if news_id:
+                    article["_db_id"] = news_id
+                    saved_ids.append((news_id, article))
                     new_unique_count += 1
         except Exception as e:
             logger.error(f"Błąd zapisu artykułu: {e}")
 
     logger.info(
         f"   Zapisano {len(saved_ids)} nowych, "
-        f"{new_unique_count} unikalnych"
+        f"{new_unique_count} unikalnych, "
+        f"{len(merge_targets)} połączeń źródeł"
     )
+
+    # Newsy już wcześniej wysłane, które właśnie dostały nowe potwierdzające źródło
+    if merge_targets:
+        logger.info(f"🔗 Łączenie źródeł: {len(merge_targets)} newsów dostało nowe źródło")
+        _send_merge_updates(merge_targets)
 
     if new_unique_count == 0:
         logger.info("Brak nowych unikalnych newsów")
@@ -201,14 +278,33 @@ def run_monitor_cycle():
                 break
 
             try:
+                # Czy w tym samym cyklu dołączono już inne źródła na ten sam temat?
+                # (merge na poziomie partii - patrz deduplicator.merge_into_article)
+                extra_sources = database.get_news_sources(news_id)
+                source_names = None
+                gen_article = article
+                if extra_sources:
+                    merged_desc = content_generator.build_merged_description(
+                        article, extra_sources
+                    )
+                    gen_article = {**article, "description": merged_desc}
+                    source_names = [article.get("source_name", "")] + [
+                        s.get("source_name", "") for s in extra_sources
+                    ]
+                    source_names = [n for n in source_names if n]
+
                 # Generuj treści i wyślij JEDNĄ połączoną wiadomość
-                content = content_generator.generate_content(article)
+                content = content_generator.generate_content(gen_article)
                 if content:
                     database.save_generated_content(
                         news_id, content, model=config.HF_MODEL
                     )
                     database.mark_content_generated(news_id)
-                    success = notifier.send_content_notification(article, content)
+
+                    success = notifier.send_content_notification(
+                        article, content,
+                        source_names=source_names,
+                    )
                 else:
                     # Fallback: wyślij sam news bez treści
                     success = notifier.send_news_notification(article)
@@ -257,11 +353,11 @@ def initialize():
 
     # Sprawdź konfigurację
     errors = config.validate_config()
-    warnings = [e for e in errors if "HuggingFace" in e]
+    hf_warnings = [e for e in errors if "HuggingFace" in e]
     critical_errors = [e for e in errors if "TELEGRAM" in e]
 
-    if warnings:
-        for w in warnings:
+    if hf_warnings:
+        for w in hf_warnings:
             logger.warning(f"⚠️  {w}")
         logger.warning("Generator treści AI wyłączony - będą używane szablony")
 

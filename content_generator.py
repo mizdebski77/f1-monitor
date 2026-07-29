@@ -7,11 +7,41 @@ Fallback: szablony (gdy API niedostępne lub limit wyczerpany).
 import json
 import re
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import requests
 from loguru import logger
 
 import config
+
+
+# ============================================================
+# POMOCNICZE
+# ============================================================
+def _smart_truncate(text: str, max_len: int) -> str:
+    """
+    Przycina tekst do max_len znaków, starając się nie urywać w środku
+    słowa lub zdania (ucina na granicy zdania jeśli to możliwe, inaczej
+    na granicy słowa), i dodaje "…" gdy tekst został skrócony.
+
+    Bez tego, pełny zeskrapowany tekst artykułu (czasem kilka tysięcy
+    znaków, jako JEDNA linia bez naturalnych podziałów) trafiał wprost
+    do postów social media, co potrafiło rozwalać limit 4096 znaków
+    wiadomości Telegrama - chunk z treścią artykułu był wtedy odrzucany
+    przez Telegram (błąd 400, za długa wiadomość) i ginął bez śladu,
+    przez co powiadomienie wyglądało jakby artykuł był "pusty".
+    """
+    if not text or len(text) <= max_len:
+        return text or ""
+
+    truncated = text[:max_len]
+    last_period = truncated.rfind(". ")
+    if last_period > max_len * 0.5:
+        return truncated[: last_period + 1]
+
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated.rstrip() + "…"
 
 
 # ============================================================
@@ -115,7 +145,7 @@ def _build_content_prompt(article: Dict) -> str:
     Zwraca dobrze ustrukturyzowany prompt dla modelu Mistral/Zephyr.
     """
     title = article.get("title", "")
-    description = article.get("description", "")
+    description = _smart_truncate(article.get("description", "") or "", 1500)
     source = article.get("source_name", "")
     priority = article.get("priority", "LOW")
     url = article.get("url", "")
@@ -182,9 +212,16 @@ def _parse_generated_content(raw_text: str) -> Optional[Dict[str, str]]:
                 "twitter_post", "seo_title", "hashtags", "graphic_idea"
             ]
             if all(k in data for k in required):
-                # Obetnij Twitter do 280 znaków
+                # Obetnij pola do bezpiecznych długości - zabezpieczenie
+                # przed tym, żeby model AI (lub coś w pipeline) nie zwrócił
+                # nadmiarowo długiego tekstu, który rozwaliłby limit
+                # wiadomości Telegrama (patrz _smart_truncate).
                 if len(data.get("twitter_post", "")) > 280:
                     data["twitter_post"] = data["twitter_post"][:277] + "..."
+                if len(data.get("instagram_post", "")) > 1200:
+                    data["instagram_post"] = _smart_truncate(data["instagram_post"], 1200)
+                if len(data.get("facebook_post", "")) > 2000:
+                    data["facebook_post"] = _smart_truncate(data["facebook_post"], 2000)
                 return data
         except json.JSONDecodeError:
             pass
@@ -231,6 +268,74 @@ def _parse_by_sections(text: str) -> Optional[Dict[str, str]]:
         return result
 
     return None
+
+
+# ============================================================
+# ŁĄCZENIE OPISÓW Z WIELU ŹRÓDEŁ (TEN SAM TEMAT)
+# ============================================================
+def _build_merge_prompt(primary_desc: str, primary_source: str, extra_sources: list) -> str:
+    """Buduje prompt do połączenia opisów tego samego newsa z kilku źródeł w jeden."""
+    sources_text = f"Źródło 1 ({primary_source}): {primary_desc}\n"
+    for i, s in enumerate(extra_sources, start=2):
+        sources_text += f"Źródło {i} ({s.get('source_name', '?')}): {s.get('description', '')}\n"
+
+    return f"""<s>[INST] Poniżej są opisy TEJ SAMEJ informacji ze świata Formuły 1, pochodzące z {1 + len(extra_sources)} różnych źródeł. Połącz je w JEDEN spójny, wyczerpujący opis w języku polskim (3-5 zdań), zachowując wszystkie unikalne i konkretne szczegóły z każdego źródła, usuwając powtórzenia. Nie wspominaj nazw źródeł w tekście, nie pisz "według źródła X".
+
+{sources_text}
+Zwróć WYŁĄCZNIE połączony opis po polsku, bez żadnych dodatkowych komentarzy czy nagłówków. [/INST]"""
+
+
+def build_merged_description(article: Dict, extra_sources: list) -> str:
+    """
+    Łączy opis głównego artykułu z opisami dodatkowych źródeł (ten sam temat)
+    w jedno spójne podsumowanie. Próbuje HuggingFace API, a w razie braku/błędu
+    używa prostego złożenia opisów oznaczonych nazwą źródła.
+
+    Args:
+        article: Główny (pierwszy wykryty) artykuł
+        extra_sources: Lista dodatkowych źródeł [{"source_name", "description", ...}, ...]
+
+    Returns:
+        Połączony opis (string)
+    """
+    primary_desc = _smart_truncate(article.get("description", "") or "", 1200)
+    primary_source = article.get("source_name", "")
+
+    if not extra_sources:
+        return primary_desc
+
+    # Przycinamy też opisy dodatkowych źródeł - zeskrapowane artykuły mogą
+    # mieć po kilka tysięcy znaków w jednej "linii" (bez naturalnych podziałów),
+    # co potrafiło rozwalać limit wiadomości Telegrama i gubić całą treść
+    # powiadomienia (patrz _smart_truncate powyżej).
+    trimmed_extra = [
+        {**s, "description": _smart_truncate(s.get("description", "") or "", 1200)}
+        for s in extra_sources
+    ]
+
+    if config.HUGGINGFACE_API_TOKEN:
+        try:
+            prompt = _build_merge_prompt(primary_desc, primary_source, trimmed_extra)
+            raw = _call_huggingface_api(prompt)
+            if raw:
+                merged = raw.strip().strip('"').strip()
+                if merged and len(merged) > 20:
+                    logger.info(
+                        f"✅ Opis połączony przez AI z {1 + len(extra_sources)} źródeł"
+                    )
+                    return merged
+            logger.warning("AI nie zwróciło sensownego połączonego opisu - fallback do prostego złożenia")
+        except Exception as e:
+            logger.warning(f"Błąd łączenia opisów przez AI: {e} - fallback do prostego złożenia")
+
+    # Fallback: proste złożenie opisów oznaczonych nazwą źródła
+    parts = []
+    if primary_desc:
+        parts.append(f"[{primary_source}] {primary_desc}")
+    for s in trimmed_extra:
+        if s.get("description"):
+            parts.append(f"[{s.get('source_name', '?')}] {s['description']}")
+    return "\n\n".join(parts) if parts else primary_desc
 
 
 # ============================================================
@@ -314,8 +419,12 @@ def _generate_template_content(article: Dict) -> Dict[str, str]:
     }
     emoji = emoji_map.get(priority, "🏎️")
 
-    # Opis do użycia w postach - pełny tekst bez limitu
-    desc = description if description else ""
+    # Opis do użycia w postach - przycięty do rozmiaru realnego posta social
+    # media (prawdziwy Instagram/Facebook caption nie ma kilku tysięcy znaków;
+    # bez tego przycięcia pełny zeskrapowany tekst artykułu trafiał tu w
+    # całości jako jedna "linia" i potrafił rozwalać limit wiadomości
+    # Telegrama, gubiąc całą treść po drodze)
+    desc = _smart_truncate(description, 800) if description else ""
 
     # Hashtagi
     hashtags = _generate_hashtags(title, priority)
@@ -353,7 +462,7 @@ def _generate_template_content(article: Dict) -> Dict[str, str]:
         f"{hashtags}"
     )
 
-    # ── Instagram ───────────────────────────────────────────
+    # ── Instagram (hashtagi dodawane są osobno przy wyświetlaniu) ──
     instagram = (
         f"{emoji} {priority_pl}: {title}\n\n"
         f"{'─' * 30}\n\n"
@@ -361,8 +470,7 @@ def _generate_template_content(article: Dict) -> Dict[str, str]:
         f"{'─' * 30}\n\n"
         f"📡 Źródło: {source}\n"
         f"🔗 Link w bio!\n\n"
-        f"Co o tym myślisz? Napisz w komentarzu! 👇\n\n"
-        f"{hashtags}"
+        f"Co o tym myślisz? Napisz w komentarzu! 👇"
     )
 
     # ── Facebook ────────────────────────────────────────────
@@ -534,10 +642,26 @@ def generate_content(article: Dict) -> Dict[str, str]:
     return content
 
 
-def format_content_for_telegram(article: Dict, content: Dict[str, str]) -> str:
+def format_content_for_telegram(
+    article: Dict,
+    content: Dict[str, str],
+    source_names: Optional[List[str]] = None,
+    is_update: bool = False,
+) -> str:
     """
     Formatuje wygenerowane treści do wysłania przez Telegram.
-    Jeden zwarty post: emoji + priorytet + tytuł + opis + źródło + hashtagi + link.
+
+    W przeciwieństwie do wcześniejszej wersji NIE wstawia surowego opisu z RSS -
+    pokazuje GOTOWE, już skrócone wersje na Instagram i Twitter/X, wygenerowane
+    przez content_generator, żeby nie trzeba było ich ręcznie wklejać do czata
+    do przeformatowania. Tekst na Twitter/X jest tylko do recznego wklejenia -
+    system nie postuje automatycznie (brak płatnego dostępu do X API).
+
+    Args:
+        article: Dane newsa (title, source_name, url, priority...)
+        content: Wygenerowane treści (instagram_post, twitter_post, hashtags...)
+        source_names: Lista nazw źródeł, jeśli news jest połączeniem kilku źródeł
+        is_update: True jeśli to wiadomość-aktualizacja (nowe źródło dołączone później)
     """
     title = article.get("title", "")
     priority = article.get("priority", "LOW")
@@ -553,46 +677,56 @@ def format_content_for_telegram(article: Dict, content: Dict[str, str]) -> str:
         "LOW": "🟢 F1 INFO",
     }.get(priority, "F1 INFO")
 
-    # Użyj opisu bezpośrednio z artykułu
-    description = article.get("description", "")
+    banner = "🔄 AKTUALIZACJA (potwierdzone przez kolejne źródło)" if is_update else "🆕 NOWY NEWS"
 
+    instagram_post = (content.get("instagram_post") or "").strip()
+    twitter_post = (content.get("twitter_post") or "").strip()
     hashtags = content.get("hashtags", "")
     graphic = content.get("graphic_idea", "")
 
     parts = [
-        f"{emoji} {priority_pl}",
-        f"",
+        f"{emoji} {priority_pl} — {banner}",
+        "",
         f"📌 {title}",
-        f"",
-        f"{sep}",
-        f"",
-        f"{description}",
-        f"",
-        f"{sep}",
-        f"",
+        "",
     ]
 
-    if source:
+    if source_names and len(source_names) > 1:
+        parts.append(f"📡 Potwierdzone przez {len(source_names)} źródeł: {', '.join(source_names)}")
+    elif source:
         parts.append(f"📡 Źródło: {source}")
     if url:
         parts.append(f"🔗 {url}")
 
     parts.append("")
-
+    parts.append(sep)
+    parts.append("")
+    parts.append("📸 INSTAGRAM (skopiuj i wklej):")
+    parts.append("")
+    parts.append(instagram_post if instagram_post else "(brak treści)")
     if hashtags:
+        parts.append("")
         parts.append(hashtags)
+
+    parts.append("")
+    parts.append(sep)
+    parts.append("")
+
+    parts.append("🐦 TWITTER/X (gotowe do wklejenia):")
+    parts.append("")
+    parts.append(twitter_post if twitter_post else "(brak treści)")
 
     if graphic:
         parts.extend([
-            f"",
-            f"{sep}",
+            "",
+            sep,
             f"🖼️ Pomysł na grafikę: {graphic}",
         ])
 
     parts.extend([
-        f"",
-        f"{sep}",
-        f"🏎️ F1 Monitor Bot",
+        "",
+        sep,
+        "🏎️ F1 Monitor Bot",
     ])
 
     return "\n".join(parts)

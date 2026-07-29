@@ -6,7 +6,7 @@ Wykrywa duplikaty na dwóch poziomach:
 """
 
 import re
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from loguru import logger
 
 import config
@@ -17,6 +17,65 @@ _vectorizer = None
 _tfidf_matrix = None
 _cached_titles: List[str] = []
 _cached_ids: List[int] = []
+
+
+# ============================================================
+# ROZPOZNAWANIE TEGO SAMEGO TEMATU (kierowcy/zespoły + tekst)
+# ============================================================
+# Same wydarzenie opisane przez różne portale prawie nigdy nie ma podobnych
+# tytułów słowo w słowo (każda redakcja pisze inaczej), więc samo podobieństwo
+# TF-IDF tytułów prawie nigdy nie przekracza wysokiego progu. Dlatego oprócz
+# podobieństwa tekstu (tytuł+opis) sprawdzamy też, czy oba artykuły wspominają
+# tych samych kierowców/zespoły - to dużo mocniejszy sygnał, że chodzi o ten
+# sam temat, i pozwala obniżyć wymagany próg podobieństwa tekstu.
+DRIVER_NAMES = [
+    "hamilton", "verstappen", "leclerc", "norris", "sainz", "alonso",
+    "russell", "piastri", "perez", "bottas", "ocon", "gasly", "stroll",
+    "albon", "tsunoda", "hulkenberg", "magnussen", "zhou", "sargeant",
+    "ricciardo", "antonelli", "bearman", "colapinto", "lawson", "doohan",
+    "hadjar",
+]
+TEAM_NAMES = [
+    "ferrari", "mercedes", "red bull", "redbull", "mclaren", "alpine",
+    "aston martin", "williams", "haas", "sauber", "rb", "audi",
+]
+
+# Minimalne podobieństwo tekstu (tytuł+opis) wymagane, gdy wspólny kierowca/
+# zespół już potwierdza, że to ten sam temat - dużo niższe niż standardowy
+# DUPLICATE_THRESHOLD, bo entity match sam w sobie jest mocnym sygnałem.
+DRIVER_MATCH_MIN_SIMILARITY = 0.05
+TEAM_MATCH_MIN_SIMILARITY = 0.25
+
+
+def _combined_text(article: Dict) -> str:
+    """Tytuł (liczony podwójnie - najważniejszy) + fragment opisu."""
+    title = article.get("title", "") or ""
+    description = article.get("description", "") or ""
+    desc_short = " ".join(description.split()[:40])
+    return f"{title} {title} {desc_short}"
+
+
+def _extract_entities(text: str) -> Tuple[Set[str], Set[str]]:
+    """Zwraca (zbiór kierowców, zbiór zespołów) wspomnianych w tekście."""
+    t = text.lower()
+    drivers = {d for d in DRIVER_NAMES if d in t}
+    teams = {tm for tm in TEAM_NAMES if tm in t}
+    return drivers, teams
+
+
+def _is_same_topic(similarity: float, entities_a: Tuple[Set, Set], entities_b: Tuple[Set, Set]) -> bool:
+    """
+    Decyduje czy dwa artykuły opisują ten sam temat, łącząc podobieństwo
+    tekstu z tym, czy wspominają tych samych kierowców/zespoły.
+    """
+    drivers_a, teams_a = entities_a
+    drivers_b, teams_b = entities_b
+
+    if drivers_a & drivers_b and similarity >= DRIVER_MATCH_MIN_SIMILARITY:
+        return True
+    if teams_a & teams_b and similarity >= TEAM_MATCH_MIN_SIMILARITY:
+        return True
+    return similarity >= config.DUPLICATE_THRESHOLD
 
 
 # ============================================================
@@ -172,7 +231,7 @@ def find_duplicate(
         logger.debug(f"URL duplikat: {article['url'][:60]}...")
         return True, None
 
-    # Krok 2: Sprawdź podobieństwo tytułu
+    # Krok 2: Sprawdź podobieństwo tematu (tytuł+opis, wspomniani kierowcy/zespoły)
     if not recent_news:
         return False, None
 
@@ -180,31 +239,42 @@ def find_duplicate(
     if not new_title or len(new_title) < 10:
         return False, None
 
-    existing_titles = [n["title"] for n in recent_news]
+    new_text = _combined_text(article)
+    existing_texts = [_combined_text(n) for n in recent_news]
     existing_ids = [n["id"] for n in recent_news]
 
     # Oblicz podobieństwo
-    similarities = _get_tfidf_similarity(new_title, existing_titles)
+    similarities = _get_tfidf_similarity(new_text, existing_texts)
 
-    # Znajdź najwyższe podobieństwo
     if not similarities:
         return False, None
 
+    new_entities = _extract_entities(new_text)
+
+    # Wybierz najlepszego kandydata spośród tych, które spełniają próg
+    # (podobieństwo tekstu + ewentualnie wspólny kierowca/zespół - patrz
+    # _is_same_topic)
+    best_id: Optional[int] = None
+    best_score = 0.0
+    for idx, similarity in enumerate(similarities):
+        candidate_entities = _extract_entities(existing_texts[idx])
+        if _is_same_topic(similarity, new_entities, candidate_entities) and similarity > best_score:
+            best_score = similarity
+            best_id = existing_ids[idx]
+
     max_similarity = max(similarities)
     max_idx = similarities.index(max_similarity)
-
     logger.debug(
         f"Max similarity {max_similarity:.2f} dla: "
-        f"'{new_title[:50]}' vs '{existing_titles[max_idx][:50]}'"
+        f"'{new_title[:50]}' vs '{recent_news[max_idx]['title'][:50]}'"
     )
 
-    if max_similarity >= config.DUPLICATE_THRESHOLD:
-        original_id = existing_ids[max_idx]
+    if best_id is not None:
         logger.info(
-            f"Semantyczny duplikat ({max_similarity:.0%}): "
-            f"'{new_title[:60]}' = ID {original_id}"
+            f"Ten sam temat ({best_score:.0%}): "
+            f"'{new_title[:60]}' = ID {best_id}"
         )
-        return True, original_id
+        return True, best_id
 
     return False, None
 
@@ -217,25 +287,35 @@ def process_deduplication(
     Przetwarza listę artykułów - usuwa duplikaty i oznacza oryginały.
     Obsługuje również duplikaty wewnątrz tej samej partii.
 
+    Gdy artykuł okazuje się być duplikatem (z bazy albo z tej samej partii),
+    artykuł dostaje pole "merge_into_article" - referencję do obiektu-dict
+    oryginału z TEJ partii (jeśli dotyczy), żeby main.py mogło później
+    dopisać jego opis jako dodatkowe źródło do oryginału (zamiast po prostu
+    go wyrzucać). Dla duplikatów z bazy (duplicate_of_id) merge odbywa się
+    bezpośrednio po ID, bez potrzeby referencji do obiektu.
+
     Args:
         articles: Lista nowych artykułów
         recent_news: Lista ostatnich newsów z bazy
 
     Returns:
-        Lista artykułów z dodanymi polami is_duplicate i duplicate_of_id
+        Lista artykułów z dodanymi polami is_duplicate, duplicate_of_id
+        i merge_into_article
     """
     processed = []
     # Artykuły z tej samej partii które uznaliśmy za oryginały
     batch_originals: List[Dict] = []
 
     for article in articles:
+        article["merge_into_article"] = None
+
         # Sprawdź duplikat w bazie
         is_dup, original_id = find_duplicate(article, recent_news)
 
         if is_dup and original_id:
             article["is_duplicate"] = True
             article["duplicate_of_id"] = original_id
-            logger.debug(f"Duplikat DB: {article['title'][:60]}")
+            logger.debug(f"Duplikat DB: {article['title'][:60]} -> łączę z ID {original_id}")
             processed.append(article)
             continue
 
@@ -248,18 +328,32 @@ def process_deduplication(
 
         # Sprawdź duplikat w tej partii (te same news z wielu źródeł)
         batch_dup = False
+        batch_match: Optional[Dict] = None
         if batch_originals:
-            batch_titles = [b["title"] for b in batch_originals]
-            sims = _get_tfidf_similarity(article["title"], batch_titles)
-            if sims and max(sims) >= config.DUPLICATE_THRESHOLD:
-                batch_dup = True
-                logger.debug(
-                    f"Duplikat w partii ({max(sims):.0%}): {article['title'][:60]}"
-                )
+            new_text = _combined_text(article)
+            batch_texts = [_combined_text(b) for b in batch_originals]
+            sims = _get_tfidf_similarity(new_text, batch_texts)
+            if sims:
+                new_entities = _extract_entities(new_text)
+                best_idx = None
+                best_score = 0.0
+                for idx, sim in enumerate(sims):
+                    cand_entities = _extract_entities(batch_texts[idx])
+                    if _is_same_topic(sim, new_entities, cand_entities) and sim > best_score:
+                        best_score = sim
+                        best_idx = idx
+                if best_idx is not None:
+                    batch_dup = True
+                    batch_match = batch_originals[best_idx]
+                    logger.debug(
+                        f"Duplikat w partii ({best_score:.0%}): {article['title'][:60]} "
+                        f"-> łączę z '{batch_match['title'][:60]}'"
+                    )
 
         if batch_dup:
             article["is_duplicate"] = True
             article["duplicate_of_id"] = None
+            article["merge_into_article"] = batch_match
         elif not is_dup:
             article["is_duplicate"] = False
             article["duplicate_of_id"] = None

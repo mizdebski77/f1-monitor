@@ -30,6 +30,16 @@ HF_TIMEOUT: int = 10  # sekundy (krótszy timeout)
 
 
 # ============================================================
+# X (TWITTER)
+# ============================================================
+X_API_KEY: str = os.getenv("X_API_KEY", "")
+X_API_SECRET: str = os.getenv("X_API_SECRET", "")
+X_ACCESS_TOKEN: str = os.getenv("X_ACCESS_TOKEN", "")
+X_ACCESS_TOKEN_SECRET: str = os.getenv("X_ACCESS_TOKEN_SECRET", "")
+X_POSTING_ENABLED: bool = os.getenv("X_POSTING_ENABLED", "true").lower() == "true"
+
+
+# ============================================================
 # BAZA DANYCH
 # ============================================================
 DB_PATH: str = os.getenv("DB_PATH", "data/f1_monitor.db")

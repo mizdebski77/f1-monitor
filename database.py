@@ -60,12 +60,26 @@ CREATE TABLE IF NOT EXISTS metadata (
     updated_at TEXT NOT NULL
 );
 
+-- Tabela dodatkowych źródeł dla tego samego tematu (łączenie newsów)
+-- news_id wskazuje na "główny" news w tabeli news, do którego dopisujemy
+-- kolejne źródła opisujące ten sam temat.
+CREATE TABLE IF NOT EXISTS news_sources (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    news_id         INTEGER NOT NULL,
+    source_name     TEXT    NOT NULL,
+    url             TEXT    NOT NULL,
+    description     TEXT    DEFAULT '',
+    added_at        TEXT    NOT NULL,
+    FOREIGN KEY (news_id) REFERENCES news(id)
+);
+
 -- Indeksy dla szybkich zapytań
 CREATE INDEX IF NOT EXISTS idx_news_fetched_at    ON news(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_news_priority      ON news(priority);
 CREATE INDEX IF NOT EXISTS idx_news_notified      ON news(notified);
 CREATE INDEX IF NOT EXISTS idx_news_is_duplicate  ON news(is_duplicate);
 CREATE INDEX IF NOT EXISTS idx_news_published_at  ON news(published_at);
+CREATE INDEX IF NOT EXISTS idx_news_sources_newsid ON news_sources(news_id);
 """
 
 
@@ -93,6 +107,17 @@ def get_connection():
         conn.close()
 
 
+def _ensure_column(conn, table: str, column: str, coltype: str, default: str) -> None:
+    """
+    Dopisuje kolumnę do istniejącej tabeli, jeśli jeszcze jej nie ma.
+    Bezpieczne dla baz danych powstałych przed wprowadzeniem tej kolumny.
+    """
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype} DEFAULT {default}")
+        logger.info(f"Migracja: dodano kolumnę {table}.{column}")
+
+
 def init_db() -> None:
     """Inicjalizuje bazę danych i tworzy tabele."""
     import os
@@ -100,6 +125,8 @@ def init_db() -> None:
 
     with get_connection() as conn:
         conn.executescript(CREATE_TABLES_SQL)
+        # Migracja: starsze bazy danych mogą nie mieć tej kolumny jeszcze
+        _ensure_column(conn, "news", "sources_count", "INTEGER", "1")
 
     logger.info(f"Baza danych zainicjalizowana: {config.DB_PATH}")
 
@@ -245,6 +272,44 @@ def get_news_by_id(news_id: int) -> Optional[Dict]:
             "SELECT * FROM news WHERE id = ?", (news_id,)
         ).fetchone()
         return dict(row) if row else None
+
+
+# ============================================================
+# ŁĄCZENIE NEWSÓW Z WIELU ŹRÓDEŁ (TEN SAM TEMAT)
+# ============================================================
+def add_news_source(news_id: int, source_name: str, url: str, description: str) -> None:
+    """
+    Dopisuje kolejne źródło, które opisuje ten sam temat co news_id.
+    Zwiększa też licznik sources_count na głównym rekordzie newsa.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO news_sources (news_id, source_name, url, description, added_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (news_id, source_name, url, description, datetime.utcnow().isoformat()),
+        )
+        conn.execute(
+            "UPDATE news SET sources_count = COALESCE(sources_count, 1) + 1 WHERE id = ?",
+            (news_id,),
+        )
+    logger.info(f"Dodano dodatkowe źródło '{source_name}' do news_id={news_id}")
+
+
+def get_news_sources(news_id: int) -> List[Dict]:
+    """Zwraca dodatkowe źródła (poza oryginalnym), które opisują ten sam temat."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT source_name, url, description, added_at
+            FROM news_sources
+            WHERE news_id = ?
+            ORDER BY added_at ASC
+            """,
+            (news_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 # ============================================================
